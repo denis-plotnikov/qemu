@@ -44,11 +44,13 @@ typedef struct {
     unsigned long *blocks[];
 } DirtyMemoryBlocks;
 
+typedef QLIST_HEAD(, RAMBlock) RamBlockList;
+
 typedef struct RAMList {
     QemuMutex mutex;
     RAMBlock *mru_block;
     /* RCU-enabled, writes protected by the ramlist lock. */
-    QLIST_HEAD(, RAMBlock) blocks;
+    RamBlockList blocks;
     DirtyMemoryBlocks *dirty_memory[DIRTY_MEMORY_NUM];
     uint32_t version;
     QLIST_HEAD(, RAMBlockNotifier) ramblock_notifiers;

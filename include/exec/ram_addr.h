@@ -36,6 +36,8 @@ struct RAMBlock {
     char idstr[256];
     /* RCU-enabled, writes protected by the ramlist lock */
     QLIST_ENTRY(RAMBlock) next;
+    /* blocks used for background snapshot */
+    QLIST_ENTRY(RAMBlock) bgs_next;
     QLIST_HEAD(, RAMBlockNotifier) ramblock_notifiers;
     int fd;
     size_t page_size;
@@ -49,6 +51,11 @@ struct RAMBlock {
     unsigned long *unsentmap;
     /* bitmap of already received pages in postcopy */
     unsigned long *receivedmap;
+    /* The following 2 are for background snapshot */
+    /* Pages currently being copied */
+    unsigned long *touched_map;
+    /* Pages has been copied already */
+    unsigned long *copied_map;
 };
 
 static inline bool offset_in_ramblock(RAMBlock *b, ram_addr_t offset)
