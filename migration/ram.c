@@ -2290,6 +2290,52 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss,
     return pages;
 }
 
+/* BackGround Snapshot Blocks */
+static RamBlockList bgs_blocks;
+
+static RamBlockList *ram_bgs_block_list_get(void)
+{
+    return &bgs_blocks;
+}
+
+void ram_block_list_create(void)
+{
+    RAMBlock *block = NULL;
+    RamBlockList *block_list = ram_bgs_block_list_get();
+
+    qemu_mutex_lock_ramlist();
+    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+        memory_region_ref(block->mr);
+        QLIST_INSERT_HEAD(block_list, block, bgs_next);
+    }
+    qemu_mutex_unlock_ramlist();
+}
+
+void ram_block_list_destroy(void)
+{
+    RAMBlock *next, *block;
+    RamBlockList *block_list = ram_bgs_block_list_get();
+
+    QLIST_FOREACH_SAFE(block, block_list, bgs_next, next) {
+        QLIST_REMOVE(block, bgs_next);
+        memory_region_unref(block->mr);
+    }
+}
+
+RAMBlock *ram_bgs_block_find(uint8_t *address, ram_addr_t *page_offset)
+{
+    RAMBlock *block = NULL;
+    RamBlockList *block_list = ram_bgs_block_list_get();
+
+    QLIST_FOREACH(block, block_list, bgs_next) {
+        if (address - block->host < block->max_length) {
+            *page_offset = (address - block->host) & TARGET_PAGE_MASK;
+            return block;
+        }
+    }
+
+    return NULL;
+}
 /**
  * ram_find_and_save_block: finds a dirty page and sends it to f
  *

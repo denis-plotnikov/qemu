@@ -70,4 +70,10 @@ int64_t ramblock_recv_bitmap_send(QEMUFile *file,
                                   const char *block_name);
 int ram_dirty_bitmap_reload(MigrationState *s, RAMBlock *rb);
 
+/* For background snapshot */
+void ram_block_list_create(void);
+void ram_block_list_destroy(void);
+
+RAMBlock *ram_bgs_block_find(uint8_t *address, ram_addr_t *page_offset);
+
 #endif
