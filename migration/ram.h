@@ -83,4 +83,5 @@ int ram_page_buffer_free(void *buffer);
 int ram_block_list_set_readonly(void);
 int ram_block_list_set_writable(void);
 
+int ram_copy_page(RAMBlock *block, unsigned long page_nr, void **page_copy);
 #endif

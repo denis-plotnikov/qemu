@@ -2491,6 +2491,70 @@ RAMBlock *ram_bgs_block_find(uint8_t *address, ram_addr_t *page_offset)
 }
 
 /**
+ * ram_copy_page: make a page copy
+ *
+ * Used in the background snapshot to make a copy of a memeory page.
+ * Ensures that the memeory page is copied only once.
+ * When a page copy is done, restores read/write access to the memory
+ * page.
+ * If a page is being copied by another thread, wait until the copying
+ * ends and exit.
+ *
+ * Returns:
+ *   -1 - on error
+ *    0 - the page wasn't copied by the function call
+ *    1 - the page has been copied
+ *
+ * @block:     RAM block to use
+ * @page_nr:   the page number to copy
+ * @page_copy: the pointer to return a page copy
+ *
+ */
+int ram_copy_page(RAMBlock *block, unsigned long page_nr,
+                          void **page_copy)
+{
+    void *host_page;
+    int res = 0;
+
+    atomic_inc(&ram_state->page_copier_cnt);
+
+    if (test_and_set_bit_atomic(page_nr, block->touched_map)) {
+        while (!test_bit_atomic(page_nr, block->copied_map)) {
+            /* the page is being copied -- wait for the end of the copying
+             * and check once again
+             */
+            qemu_event_wait(&ram_state->page_copying_done);
+        }
+        goto out;
+    }
+
+    *page_copy = ram_page_buffer_get();
+    if (!*page_copy) {
+        res =-1;
+        goto out;
+    }
+
+    host_page = block->host + (page_nr << TARGET_PAGE_BITS);
+    memcpy(*page_copy, host_page, TARGET_PAGE_SIZE);
+
+    if (ram_set_rw(host_page, TARGET_PAGE_SIZE)) {
+        ram_page_buffer_free(*page_copy);
+        *page_copy = NULL;
+        res = -1;
+        goto out;
+    }
+
+    set_bit_atomic(page_nr, block->copied_map);
+    qemu_event_set(&ram_state->page_copying_done);
+    qemu_event_reset(&ram_state->page_copying_done);
+
+    res = 1;
+out:
+    atomic_dec(&ram_state->page_copier_cnt);
+    return res;
+}
+
+/**
  * ram_find_and_save_block: finds a dirty page and sends it to f
  *
  * Called within an RCU critical section.
