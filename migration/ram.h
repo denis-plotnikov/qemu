@@ -76,4 +76,7 @@ void ram_block_list_destroy(void);
 
 RAMBlock *ram_bgs_block_find(uint8_t *address, ram_addr_t *page_offset);
 
+void *ram_page_buffer_get(void);
+int ram_page_buffer_free(void *buffer);
+
 #endif

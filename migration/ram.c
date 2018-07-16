@@ -275,6 +275,19 @@ struct RAMSrcPageRequest {
     QSIMPLEQ_ENTRY(RAMSrcPageRequest) next_req;
 };
 
+/* Page buffer used for background snapshot */
+typedef struct RAMPageBuffer {
+    /* Page buffer capacity in host pages */
+    int capacity;
+    /* Current number of pages in the buffer */
+    int used;
+    /* Mutex to protect the page buffer */
+    QemuMutex lock;
+    /* To notify the requestor when the page buffer can be accessed again */
+    /* Page buffer allows access when used < capacity */
+    QemuCond used_decreased_cond;
+} RAMPageBuffer;
+
 /* State of RAM for migration */
 struct RAMState {
     /* QEMUFile used for this migration */
@@ -313,6 +326,12 @@ struct RAMState {
     /* Queue of outstanding page requests from the destination */
     QemuMutex src_page_req_mutex;
     QSIMPLEQ_HEAD(src_page_requests, RAMSrcPageRequest) src_page_requests;
+    /* The following 2 are for background snapshot */
+    /* Buffer data to store copies of ram pages while async vm saving */
+    RAMPageBuffer page_buffer;
+    QemuEvent page_copying_done;
+    /* The number of treads is trying to make a page copy */
+    uint64_t page_copier_cnt;
 };
 typedef struct RAMState RAMState;
 
@@ -2322,6 +2341,50 @@ void ram_block_list_destroy(void)
     }
 }
 
+static void ram_page_buffer_decrease_used(void)
+{
+    qemu_mutex_lock(&ram_state->page_buffer.lock);
+    ram_state->page_buffer.used--;
+    qemu_cond_signal(&ram_state->page_buffer.used_decreased_cond);
+    qemu_mutex_unlock(&ram_state->page_buffer.lock);
+}
+
+static void ram_page_buffer_increase_used_wait(void)
+{
+    RAMState *rs = ram_state;
+
+    qemu_mutex_lock(&rs->page_buffer.lock);
+
+    if (rs->page_buffer.used == rs->page_buffer.capacity) {
+       qemu_cond_wait(&rs->page_buffer.used_decreased_cond,
+                      &rs->page_buffer.lock);
+    }
+
+    rs->page_buffer.used++;
+
+    qemu_mutex_unlock(&rs->page_buffer.lock);
+}
+
+void *ram_page_buffer_get(void)
+{
+    void *page;
+    ram_page_buffer_increase_used_wait();
+    page = mmap(0, TARGET_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (page == MAP_FAILED) {
+        ram_page_buffer_decrease_used();
+        page = NULL;
+    }
+    return page;
+}
+
+int ram_page_buffer_free(void *buffer)
+{
+    ram_page_buffer_decrease_used();
+    return qemu_madvise(buffer, TARGET_PAGE_SIZE, MADV_DONTNEED);
+}
+
 RAMBlock *ram_bgs_block_find(uint8_t *address, ram_addr_t *page_offset)
 {
     RAMBlock *block = NULL;
@@ -2336,6 +2399,7 @@ RAMBlock *ram_bgs_block_find(uint8_t *address, ram_addr_t *page_offset)
 
     return NULL;
 }
+
 /**
  * ram_find_and_save_block: finds a dirty page and sends it to f
  *
@@ -2429,6 +2493,19 @@ static void xbzrle_load_cleanup(void)
 static void ram_state_cleanup(RAMState **rsp)
 {
     if (*rsp) {
+        if (migrate_background_snapshot()) {
+            qemu_mutex_destroy(&(*rsp)->page_buffer.lock);
+            qemu_cond_destroy(&(*rsp)->page_buffer.used_decreased_cond);
+            /* In case somebody is still waiting for the event */
+            /* Make sure they have done with their copying routine */
+            /* and don't need the event any more */
+            while (atomic_read(&(*rsp)->page_copier_cnt)) {
+                qemu_event_set(&(*rsp)->page_copying_done);
+                qemu_event_reset(&(*rsp)->page_copying_done);
+            }
+            qemu_event_destroy(&(*rsp)->page_copying_done);
+        }
+
         migration_page_queue_free(*rsp);
         qemu_mutex_destroy(&(*rsp)->bitmap_mutex);
         qemu_mutex_destroy(&(*rsp)->src_page_req_mutex);
@@ -2468,6 +2545,13 @@ static void ram_save_cleanup(void *opaque)
         block->bmap = NULL;
         g_free(block->unsentmap);
         block->unsentmap = NULL;
+
+        if (migrate_background_snapshot()) {
+            g_free(block->touched_map);
+            block->touched_map = NULL;
+            g_free(block->copied_map);
+            block->copied_map = NULL;
+        }
     }
 
     xbzrle_cleanup();
@@ -2482,6 +2566,10 @@ static void ram_state_reset(RAMState *rs)
     rs->last_page = 0;
     rs->last_version = ram_list.version;
     rs->ram_bulk_stage = true;
+
+    /* page buffer capacity in number of pages */
+    rs->page_buffer.capacity = 1000;
+    rs->page_buffer.used = 0;
 }
 
 #define MAX_WAIT 50 /* ms, half buffered_file limit */
@@ -2966,6 +3054,13 @@ static int ram_state_init(RAMState **rsp)
      */
     (*rsp)->migration_dirty_pages = ram_bytes_total() >> TARGET_PAGE_BITS;
 
+    if (migrate_background_snapshot()) {
+        qemu_mutex_init(&(*rsp)->page_buffer.lock);
+        qemu_cond_init(&(*rsp)->page_buffer.used_decreased_cond);
+        qemu_event_init(&(*rsp)->page_copying_done, false);
+        (*rsp)->page_copier_cnt = 0;
+    }
+
     ram_state_reset(*rsp);
 
     return 0;
@@ -2982,9 +3077,15 @@ static void ram_list_init_bitmaps(void)
             pages = block->max_length >> TARGET_PAGE_BITS;
             block->bmap = bitmap_new(pages);
             bitmap_set(block->bmap, 0, pages);
+
             if (migrate_postcopy_ram()) {
                 block->unsentmap = bitmap_new(pages);
                 bitmap_set(block->unsentmap, 0, pages);
+            }
+
+            if (migrate_background_snapshot()) {
+                block->touched_map = bitmap_new(pages);
+                block->copied_map = bitmap_new(pages);
             }
         }
     }
