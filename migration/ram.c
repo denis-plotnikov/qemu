@@ -2330,6 +2330,60 @@ void ram_block_list_create(void)
     qemu_mutex_unlock_ramlist();
 }
 
+static int mem_protect(void *addr, uint64_t length, int prot)
+{
+    int ret = mprotect(addr, length, prot);
+
+    if (ret < 0) {
+        error_report("%s: Can't change protection on ram block at %p",
+                     __func__, addr);
+    }
+
+    return ret;
+}
+
+static int ram_set_ro(void *addr, uint64_t length)
+{
+    return mem_protect(addr, length, PROT_READ);
+}
+
+static int ram_set_rw(void *addr, uint64_t length)
+{
+    return mem_protect(addr, length, PROT_READ | PROT_WRITE);
+}
+
+int ram_block_list_set_readonly(void)
+{
+    RAMBlock *block = NULL;
+    RamBlockList *block_list = ram_bgs_block_list_get();
+    int ret = 0;
+
+    QLIST_FOREACH(block, block_list, bgs_next) {
+        ret = ram_set_ro(block->host, block->used_length);
+        if (ret) {
+            break;
+        }
+    }
+
+    return ret;
+}
+
+int ram_block_list_set_writable(void)
+{
+    RAMBlock *block = NULL;
+    RamBlockList *block_list = ram_bgs_block_list_get();
+    int ret = 0;
+
+    QLIST_FOREACH(block, block_list, bgs_next) {
+        ret = ram_set_rw(block->host, block->used_length);
+        if (ret) {
+            break;
+        }
+    }
+
+    return ret;
+}
+
 void ram_block_list_destroy(void)
 {
     RAMBlock *next, *block;
