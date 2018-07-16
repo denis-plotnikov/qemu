@@ -2073,7 +2073,7 @@ static void migrate_handle_rp_req_pages(MigrationState *ms, const char* rbname,
         return;
     }
 
-    if (ram_save_queue_pages(rbname, start, len)) {
+    if (ram_save_queue_pages(NULL, rbname, start, len, NULL)) {
         mark_source_rp_bad(ms);
     }
 }

@@ -271,6 +271,7 @@ struct RAMSrcPageRequest {
     RAMBlock *rb;
     hwaddr    offset;
     hwaddr    len;
+    void     *page_copy;
 
     QSIMPLEQ_ENTRY(RAMSrcPageRequest) next_req;
 };
@@ -353,6 +354,8 @@ struct PageSearchStatus {
     unsigned long page;
     /* Set once we wrap around */
     bool         complete_round;
+    /* Pointer to the cached page */
+    void *page_copy;
 };
 typedef struct PageSearchStatus PageSearchStatus;
 
@@ -1691,10 +1694,14 @@ static void migration_bitmap_sync(RAMState *rs)
  * @rs: current RAM state
  * @block: block that contains the page we want to send
  * @offset: offset inside the block for the page
+ * @page_copy: pointer to the page, if null the page pointer
+ *             is calculated based on block and offset
  */
-static int save_zero_page(RAMState *rs, RAMBlock *block, ram_addr_t offset)
+static int save_zero_page(RAMState *rs, RAMBlock *block, ram_addr_t offset,
+                          uint8_t *page_copy)
 {
-    uint8_t *p = block->host + offset;
+
+    uint8_t *p = page_copy ? page_copy : block->host + offset;
     int pages = -1;
 
     if (is_zero_range(p, TARGET_PAGE_SIZE)) {
@@ -1773,9 +1780,11 @@ static int save_normal_page(RAMState *rs, RAMBlock *block, ram_addr_t offset,
     ram_counters.transferred += save_page_header(rs, rs->f, block,
                                                  offset | RAM_SAVE_FLAG_PAGE);
     if (async) {
-        qemu_put_buffer_async(rs->f, buf, TARGET_PAGE_SIZE,
-                              migrate_release_ram() &
-                              migration_in_postcopy());
+        bool may_free = migrate_background_snapshot() ||
+                        (migrate_release_ram() &&
+                         migration_in_postcopy());
+
+        qemu_put_buffer_async(rs->f, buf, TARGET_PAGE_SIZE, may_free);
     } else {
         qemu_put_buffer(rs->f, buf, TARGET_PAGE_SIZE);
     }
@@ -1806,7 +1815,12 @@ static int ram_save_page(RAMState *rs, PageSearchStatus *pss, bool last_stage)
     ram_addr_t offset = pss->page << TARGET_PAGE_BITS;
     ram_addr_t current_addr = block->offset + offset;
 
-    p = block->host + offset;
+    if (pss->page_copy) {
+        p = pss->page_copy;
+    } else {
+        p = block->host + offset;
+    }
+
     trace_ram_save_page(block->idstr, (uint64_t)offset, p);
 
     XBZRLE_cache_lock();
@@ -1997,7 +2011,8 @@ static bool find_dirty_block(RAMState *rs, PageSearchStatus *pss, bool *again)
  * @rs: current RAM state
  * @offset: used to return the offset within the RAMBlock
  */
-static RAMBlock *unqueue_page(RAMState *rs, ram_addr_t *offset)
+static RAMBlock *unqueue_page(RAMState *rs, ram_addr_t *offset,
+                              void **page_copy)
 {
     RAMBlock *block = NULL;
 
@@ -2007,10 +2022,14 @@ static RAMBlock *unqueue_page(RAMState *rs, ram_addr_t *offset)
                                 QSIMPLEQ_FIRST(&rs->src_page_requests);
         block = entry->rb;
         *offset = entry->offset;
+        *page_copy = entry->page_copy;
 
         if (entry->len > TARGET_PAGE_SIZE) {
             entry->len -= TARGET_PAGE_SIZE;
             entry->offset += TARGET_PAGE_SIZE;
+            if (entry->page_copy) {
+                entry->page_copy += TARGET_PAGE_SIZE / sizeof(void *);
+            }
         } else {
             memory_region_unref(block->mr);
             QSIMPLEQ_REMOVE_HEAD(&rs->src_page_requests, next_req);
@@ -2038,9 +2057,10 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
     RAMBlock  *block;
     ram_addr_t offset;
     bool dirty;
+    void *page_copy;
 
     do {
-        block = unqueue_page(rs, &offset);
+        block = unqueue_page(rs, &offset, &page_copy);
         /*
          * We're sending this page, and since it's postcopy nothing else
          * will dirty it, and we must make sure it doesn't get sent again
@@ -2078,6 +2098,7 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
          */
         pss->block = block;
         pss->page = offset >> TARGET_PAGE_BITS;
+        pss->page_copy = page_copy;
     }
 
     return !!block;
@@ -2115,17 +2136,26 @@ static void migration_page_queue_free(RAMState *rs)
  *
  * @rbname: Name of the RAMBLock of the request. NULL means the
  *          same that last one.
+ * @block: RAMBlock to use.
+ *         When @block is provided, then @rbname is ignored
  * @start: starting address from the start of the RAMBlock
  * @len: length (in bytes) to send
+ * @page_copy: the page to copy to destination. If not specified,
+ *             will use the page data specified by @start and @len.
  */
-int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len)
+int ram_save_queue_pages(RAMBlock *block, const char *rbname,
+                         ram_addr_t start, ram_addr_t len, void *page_copy)
 {
     RAMBlock *ramblock;
     RAMState *rs = ram_state;
 
     ram_counters.postcopy_requests++;
+
     rcu_read_lock();
-    if (!rbname) {
+
+    if (block) {
+        ramblock = block;
+    } else if (!rbname) {
         /* Reuse last RAMBlock */
         ramblock = rs->last_req_rb;
 
@@ -2160,6 +2190,7 @@ int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len)
     new_entry->rb = ramblock;
     new_entry->offset = start;
     new_entry->len = len;
+    new_entry->page_copy = page_copy;
 
     memory_region_ref(ramblock->mr);
     qemu_mutex_lock(&rs->src_page_req_mutex);
@@ -2224,7 +2255,7 @@ static int ram_save_target_page(RAMState *rs, PageSearchStatus *pss,
             flush_compressed_data(rs);
     }
 
-    res = save_zero_page(rs, block, offset);
+    res = save_zero_page(rs, block, offset, pss->page_copy);
     if (res > 0) {
         /* Must let xbzrle know, otherwise a previous (now 0'd) cached
          * page would be stale
@@ -2234,7 +2265,12 @@ static int ram_save_target_page(RAMState *rs, PageSearchStatus *pss,
             xbzrle_cache_zero_page(rs, block->offset + offset);
             XBZRLE_cache_unlock();
         }
-        ram_release_pages(block->idstr, offset, res);
+
+        if (pss->page_copy) {
+            qemu_madvise(pss->page_copy, TARGET_PAGE_SIZE, MADV_DONTNEED);
+        } else {
+            ram_release_pages(block->idstr, offset, res);
+        }
         return res;
     }
 
@@ -2482,6 +2518,7 @@ static int ram_find_and_save_block(RAMState *rs, bool last_stage)
     pss.block = rs->last_seen_block;
     pss.page = rs->last_page;
     pss.complete_round = false;
+    pss.page_copy = NULL;
 
     if (!pss.block) {
         pss.block = QLIST_FIRST_RCU(&ram_list.blocks);
