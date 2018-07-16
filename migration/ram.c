@@ -2555,6 +2555,49 @@ out:
 }
 
 /**
+ * ram_process_page_fault
+ *
+ * Used in the background snapshot to queue the copy of the memory
+ * page for writing.
+ *
+ * Returns:
+ *    0 > - on error
+ *    0   - success
+ *
+ * @address:  guest address
+ *
+ */
+int ram_process_page_fault(void *address)
+{
+    int ret;
+    void *page_copy = NULL;
+    unsigned long page_nr;
+    ram_addr_t offset;
+
+    RAMBlock *block = ram_bgs_block_find(address, &offset);
+
+    if (!block) {
+        return -1;
+    }
+
+    page_nr = offset >> TARGET_PAGE_BITS;
+
+    ret = ram_copy_page(block, page_nr, &page_copy);
+
+    if (ret < 0) {
+        return ret;
+    } else if (ret > 0) {
+        if (ram_save_queue_pages(block, NULL, offset,
+                                 TARGET_PAGE_SIZE, page_copy)) {
+            ram_page_buffer_free(page_copy);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/**
  * ram_find_and_save_block: finds a dirty page and sends it to f
  *
  * Called within an RCU critical section.
