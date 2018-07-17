@@ -2595,10 +2595,27 @@ static int ram_find_and_save_block(RAMState *rs, bool last_stage)
         if (!found) {
             /* priority queue empty, so just search for something dirty */
             found = find_dirty_block(rs, &pss, &again);
+
+            if (found && migrate_background_snapshot()) {
+                /* make a copy of the page and
+                 * pass it to the page search status */
+                int ret;
+                ret = ram_copy_page(pss.block, pss.page, &pss.page_copy);
+                if (ret == 0) {
+                    found = false;
+                    pages = 0;
+                } else if (ret < 0) {
+                    return ret;
+                }
+            }
         }
 
         if (found) {
             pages = ram_save_host_page(rs, &pss, last_stage);
+        }
+
+        if (pss.page_copy) {
+            ram_page_buffer_decrease_used();
         }
     } while (!pages && again);
 
