@@ -42,6 +42,9 @@ void qemu_savevm_state_pending(QEMUFile *f, uint64_t max_size,
                                uint64_t *res_precopy_only,
                                uint64_t *res_compatible,
                                uint64_t *res_postcopy_only);
+int qemu_savevm_state_save(QEMUFile *f,
+                           bool inactivate_disks,
+                           bool send_eof);
 void qemu_savevm_send_ping(QEMUFile *f, uint32_t value);
 void qemu_savevm_send_open_return_path(QEMUFile *f);
 int qemu_savevm_send_packaged(QEMUFile *f, const uint8_t *buf, size_t len);

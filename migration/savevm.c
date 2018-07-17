@@ -1164,51 +1164,15 @@ void qemu_savevm_state_complete_postcopy(QEMUFile *f)
     qemu_fflush(f);
 }
 
-int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
-                                       bool inactivate_disks)
+int qemu_savevm_state_save(QEMUFile *f, bool inactivate_disks,
+                           bool send_eof)
 {
-    QJSON *vmdesc;
     int vmdesc_len;
     SaveStateEntry *se;
     int ret;
-    bool in_postcopy = migration_in_postcopy();
-
-    trace_savevm_state_complete_precopy();
+    QJSON *vmdesc = qjson_new();
 
     cpu_synchronize_all_states();
-
-    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
-        if (!se->ops ||
-            (in_postcopy && se->ops->has_postcopy &&
-             se->ops->has_postcopy(se->opaque)) ||
-            (in_postcopy && !iterable_only) ||
-            !se->ops->save_live_complete_precopy) {
-            continue;
-        }
-
-        if (se->ops && se->ops->is_active) {
-            if (!se->ops->is_active(se->opaque)) {
-                continue;
-            }
-        }
-        trace_savevm_section_start(se->idstr, se->section_id);
-
-        save_section_header(f, se, QEMU_VM_SECTION_END);
-
-        ret = se->ops->save_live_complete_precopy(f, se->opaque);
-        trace_savevm_section_end(se->idstr, se->section_id, ret);
-        save_section_footer(f, se);
-        if (ret < 0) {
-            qemu_file_set_error(f, ret);
-            return -1;
-        }
-    }
-
-    if (iterable_only) {
-        return 0;
-    }
-
-    vmdesc = qjson_new();
     json_prop_int(vmdesc, "page_size", qemu_target_page_size());
     json_start_array(vmdesc, "devices");
     QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
@@ -1250,8 +1214,8 @@ int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
             return ret;
         }
     }
-    if (!in_postcopy) {
-        /* Postcopy stream will still be going */
+
+    if (send_eof) {
         qemu_put_byte(f, QEMU_VM_EOF);
     }
 
@@ -1268,6 +1232,51 @@ int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
 
     qemu_fflush(f);
     return 0;
+}
+
+int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
+                                       bool inactivate_disks)
+{
+    SaveStateEntry *se;
+    int ret;
+    bool in_postcopy = migration_in_postcopy();
+
+    trace_savevm_state_complete_precopy();
+
+    cpu_synchronize_all_states();
+
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
+        if (!se->ops ||
+            (in_postcopy && se->ops->has_postcopy &&
+             se->ops->has_postcopy(se->opaque)) ||
+            (in_postcopy && !iterable_only) ||
+            !se->ops->save_live_complete_precopy) {
+            continue;
+        }
+
+        if (se->ops && se->ops->is_active) {
+            if (!se->ops->is_active(se->opaque)) {
+                continue;
+            }
+        }
+        trace_savevm_section_start(se->idstr, se->section_id);
+
+        save_section_header(f, se, QEMU_VM_SECTION_END);
+
+        ret = se->ops->save_live_complete_precopy(f, se->opaque);
+        trace_savevm_section_end(se->idstr, se->section_id, ret);
+        save_section_footer(f, se);
+        if (ret < 0) {
+            qemu_file_set_error(f, ret);
+            return -1;
+        }
+    }
+
+    if (iterable_only) {
+        return 0;
+    }
+
+    return qemu_savevm_state_save(f, inactivate_disks, !in_postcopy);
 }
 
 /* Give an estimate of the amount left to be transferred,
