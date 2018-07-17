@@ -3068,6 +3068,99 @@ static void *migration_thread(void *opaque)
     return NULL;
 }
 
+static void background_snapshot_sigsegv_handler(int unused0, siginfo_t *info,
+                                                void *unused1)
+{
+    if (ram_process_page_fault(info->si_addr)) {
+        assert(false);
+    }
+}
+
+static void *background_snapshot_thread(void *opaque)
+{
+    MigrationState *m = opaque;
+    QIOChannelBuffer *bioc;
+    QEMUFile *fb;
+    int res = 0;
+
+    rcu_register_thread();
+
+    qemu_file_set_rate_limit(m->to_dst_file, INT64_MAX);
+
+    qemu_mutex_lock_iothread();
+    vm_stop(RUN_STATE_PAUSED);
+
+    qemu_savevm_state_header(m->to_dst_file);
+    qemu_mutex_unlock_iothread();
+    qemu_savevm_state_setup(m->to_dst_file);
+    qemu_mutex_lock_iothread();
+
+    migrate_set_state(&m->state, MIGRATION_STATUS_SETUP,
+                      MIGRATION_STATUS_ACTIVE);
+
+    /* save the device state to the temporary buffer */
+    bioc = qio_channel_buffer_new(4096);
+    qio_channel_set_name(QIO_CHANNEL(bioc), "vmstate-buffer");
+    fb = qemu_fopen_channel_output(QIO_CHANNEL(bioc));
+    object_unref(OBJECT(bioc));
+
+    ram_block_list_create();
+    ram_block_list_set_readonly();
+
+    if (global_state_store()) {
+        goto exit;
+    }
+
+    if (qemu_savevm_state_save(fb, false, true) < 0) {
+        migrate_set_state(&m->state, MIGRATION_STATUS_ACTIVE,
+                          MIGRATION_STATUS_FAILED);
+        goto exit;
+    }
+
+    sigsegv_user_handler_set(background_snapshot_sigsegv_handler);
+
+    vm_start();
+    qemu_mutex_unlock_iothread();
+
+    while (!res) {
+        res = qemu_savevm_state_iterate(m->to_dst_file, false);
+
+        if (res < 0 || qemu_file_get_error(m->to_dst_file)) {
+            migrate_set_state(&m->state, MIGRATION_STATUS_ACTIVE,
+                              MIGRATION_STATUS_FAILED);
+            goto exit;
+        }
+    }
+
+    /*
+     * By this moment we have RAM saved into the stream
+     * The next step is to flush the device state right after the
+     * RAM saved. The rest of device state is stored in
+     * the temporary buffer. Do flush the buffer into the stream.
+     */
+    qemu_put_buffer(m->to_dst_file, bioc->data, bioc->usage);
+    qemu_fflush(m->to_dst_file);
+
+    if (qemu_file_get_error(m->to_dst_file)) {
+        migrate_set_state(&m->state, MIGRATION_STATUS_ACTIVE,
+                          MIGRATION_STATUS_FAILED);
+        goto exit;
+    }
+
+    migrate_set_state(&m->state, MIGRATION_STATUS_ACTIVE,
+                                 MIGRATION_STATUS_COMPLETED);
+exit:
+    ram_block_list_set_writable();
+    ram_block_list_destroy();
+    sigsegv_user_handler_reset();
+    qemu_fclose(fb);
+    qemu_mutex_lock_iothread();
+    qemu_savevm_state_cleanup();
+    qemu_mutex_unlock_iothread();
+    rcu_unregister_thread();
+    return NULL;
+}
+
 void migrate_fd_connect(MigrationState *s, Error *error_in)
 {
     int64_t rate_limit;
@@ -3123,8 +3216,14 @@ void migrate_fd_connect(MigrationState *s, Error *error_in)
         migrate_fd_cleanup(s);
         return;
     }
-    qemu_thread_create(&s->thread, "live_migration", migration_thread, s,
-                       QEMU_THREAD_JOINABLE);
+    if (migrate_background_snapshot()) {
+        qemu_thread_create(&s->thread, "bg_snapshot",
+                           background_snapshot_thread, s,
+                           QEMU_THREAD_JOINABLE);
+    } else {
+        qemu_thread_create(&s->thread, "live_migration", migration_thread, s,
+                           QEMU_THREAD_JOINABLE);
+    }
     s->migration_thread_running = true;
 }
 
