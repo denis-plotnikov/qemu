@@ -881,6 +881,12 @@ static bool migrate_caps_check(bool *cap_list,
             return false;
         }
 
+        if (cap_list[MIGRATION_CAPABILITY_BACKGROUND_SNAPSHOT]) {
+            error_setg(errp, "Postcopy is not compatible "
+                        "with background snapshot");
+            return false;
+        }
+
         /* This check is reasonably expensive, so only when it's being
          * set the first time, also it's only the destination that needs
          * special support.
@@ -891,6 +897,26 @@ static bool migrate_caps_check(bool *cap_list,
              * detailed message
              */
             error_setg(errp, "Postcopy is not supported");
+            return false;
+        }
+    }
+
+    if (cap_list[MIGRATION_CAPABILITY_BACKGROUND_SNAPSHOT]) {
+        if (cap_list[MIGRATION_CAPABILITY_RELEASE_RAM]) {
+            error_setg(errp, "Background snapshot is not compatible "
+                        "with release ram capability");
+            return false;
+        }
+
+        if (cap_list[MIGRATION_CAPABILITY_COMPRESS]) {
+            error_setg(errp, "Background snapshot is not "
+                        "currently compatible with compression");
+            return false;
+        }
+
+        if (cap_list[MIGRATION_CAPABILITY_XBZRLE]) {
+            error_setg(errp, "Background snapshot is not "
+                        "currently compatible with XBZLRE");
             return false;
         }
     }
@@ -1988,6 +2014,15 @@ bool migrate_use_block_incremental(void)
     s = migrate_get_current();
 
     return s->parameters.block_incremental;
+}
+
+bool migrate_background_snapshot(void)
+{
+    MigrationState *s;
+
+    s = migrate_get_current();
+
+    return s->enabled_capabilities[MIGRATION_CAPABILITY_BACKGROUND_SNAPSHOT];
 }
 
 /* migration thread support */

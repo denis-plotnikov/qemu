@@ -383,13 +383,19 @@
 #           devices (and thus take locks) immediately at the end of migration.
 #           (since 3.0)
 #
+# @background-snapshot: If enabled, the migration stream will be a snapshot
+#                       of the VM exactly at the point when the migration procedure
+#                       starts. The VM RAM is saved with running VM.
+#                       (since 3.1)
+#
 # Since: 1.2
 ##
 { 'enum': 'MigrationCapability',
   'data': ['xbzrle', 'rdma-pin-all', 'auto-converge', 'zero-blocks',
            'compress', 'events', 'postcopy-ram', 'x-colo', 'release-ram',
            'block', 'return-path', 'pause-before-switchover', 'x-multifd',
-           'dirty-bitmaps', 'postcopy-blocktime', 'late-block-activate' ] }
+           'dirty-bitmaps', 'postcopy-blocktime', 'late-block-activate',
+           'background-snapshot' ] }
 
 ##
 # @MigrationCapabilityStatus:
