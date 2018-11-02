@@ -3068,14 +3068,6 @@ static void *migration_thread(void *opaque)
     return NULL;
 }
 
-static void background_snapshot_sigsegv_handler(int unused0, siginfo_t *info,
-                                                void *unused1)
-{
-    if (ram_process_page_fault(info->si_addr)) {
-        assert(false);
-    }
-}
-
 static void *background_snapshot_thread(void *opaque)
 {
     MigrationState *m = opaque;
@@ -3104,20 +3096,17 @@ static void *background_snapshot_thread(void *opaque)
     fb = qemu_fopen_channel_output(QIO_CHANNEL(bioc));
     object_unref(OBJECT(bioc));
 
-    ram_block_list_create();
-    ram_block_list_set_readonly();
+    if(ram_write_tracking_start()) {
+        goto failed_resume;
+    }
 
     if (global_state_store()) {
-        goto exit;
+        goto failed_resume;
     }
 
     if (qemu_savevm_state_save(fb, false, true) < 0) {
-        migrate_set_state(&m->state, MIGRATION_STATUS_ACTIVE,
-                          MIGRATION_STATUS_FAILED);
-        goto exit;
+        goto failed_resume;
     }
-
-    sigsegv_user_handler_set(background_snapshot_sigsegv_handler);
 
     vm_start();
     qemu_mutex_unlock_iothread();
@@ -3126,9 +3115,7 @@ static void *background_snapshot_thread(void *opaque)
         res = qemu_savevm_state_iterate(m->to_dst_file, false);
 
         if (res < 0 || qemu_file_get_error(m->to_dst_file)) {
-            migrate_set_state(&m->state, MIGRATION_STATUS_ACTIVE,
-                              MIGRATION_STATUS_FAILED);
-            goto exit;
+            goto failed;
         }
     }
 
@@ -3142,17 +3129,21 @@ static void *background_snapshot_thread(void *opaque)
     qemu_fflush(m->to_dst_file);
 
     if (qemu_file_get_error(m->to_dst_file)) {
-        migrate_set_state(&m->state, MIGRATION_STATUS_ACTIVE,
-                          MIGRATION_STATUS_FAILED);
-        goto exit;
+        goto failed;
     }
 
     migrate_set_state(&m->state, MIGRATION_STATUS_ACTIVE,
                                  MIGRATION_STATUS_COMPLETED);
+    goto exit;
+
+failed_resume:
+    vm_start();
+    qemu_mutex_unlock_iothread();
+failed:
+    migrate_set_state(&m->state, MIGRATION_STATUS_ACTIVE,
+                      MIGRATION_STATUS_FAILED);
 exit:
-    ram_block_list_set_writable();
-    ram_block_list_destroy();
-    sigsegv_user_handler_reset();
+    ram_write_tracking_stop();
     qemu_fclose(fb);
     qemu_mutex_lock_iothread();
     qemu_savevm_state_cleanup();

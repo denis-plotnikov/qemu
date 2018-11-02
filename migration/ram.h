@@ -75,7 +75,7 @@ int ram_dirty_bitmap_reload(MigrationState *s, RAMBlock *rb);
 void ram_block_list_create(void);
 void ram_block_list_destroy(void);
 
-RAMBlock *ram_bgs_block_find(uint8_t *address, ram_addr_t *page_offset);
+RAMBlock *ram_bgs_block_find(uint64_t address, ram_addr_t *page_offset);
 
 void *ram_page_buffer_get(void);
 int ram_page_buffer_free(void *buffer);
@@ -84,5 +84,8 @@ int ram_block_list_set_readonly(void);
 int ram_block_list_set_writable(void);
 
 int ram_copy_page(RAMBlock *block, unsigned long page_nr, void **page_copy);
-int ram_process_page_fault(void *address);
+int ram_process_page_fault(uint64_t address);
+
+int ram_write_tracking_start(void);
+void ram_write_tracking_stop(void);
 #endif

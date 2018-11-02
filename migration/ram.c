@@ -56,6 +56,12 @@
 #include "qemu/uuid.h"
 #include "savevm.h"
 #include "qemu/iov.h"
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <linux/userfaultfd.h>
+#include <sys/eventfd.h>
+#include <inttypes.h>
+#include <poll.h>
 
 /***********************************************************/
 /* ram save/restore */
@@ -2366,26 +2372,52 @@ void ram_block_list_create(void)
     qemu_mutex_unlock_ramlist();
 }
 
-static int mem_protect(void *addr, uint64_t length, int prot)
-{
-    int ret = mprotect(addr, length, prot);
+static int page_fault_fd;
+static int thread_quit_fd;
+static QemuThread page_fault_thread;
 
-    if (ret < 0) {
-        error_report("%s: Can't change protection on ram block at %p",
-                     __func__, addr);
+static int mem_change_wp(void *addr, uint64_t length, bool protect)
+{
+    struct uffdio_writeprotect wp = { 0 };
+
+    assert(page_fault_fd);
+
+    if (protect) {
+        struct uffdio_register reg = { 0 };
+
+        reg.mode = UFFDIO_REGISTER_MODE_WP;
+        reg.range.start = (uint64_t) addr;
+        reg.range.len = length;
+
+        if (ioctl(page_fault_fd, UFFDIO_REGISTER, &reg)) {
+            error_report("Can't register memeory at %p len: %"PRIu64
+                         " for page fault interception", addr, length);
+            return -1;
+        }
+
+        wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
     }
 
-    return ret;
+    wp.range.start = (uint64_t) addr;
+    wp.range.len = length;
+
+    if (ioctl(page_fault_fd, UFFDIO_WRITEPROTECT, &wp)) {
+        error_report("Can't change protection at %p len: %"PRIu64,
+                     addr, length);
+        return -1;
+    }
+
+    return 0;
 }
 
 static int ram_set_ro(void *addr, uint64_t length)
 {
-    return mem_protect(addr, length, PROT_READ);
+    return mem_change_wp(addr, length, true);
 }
 
 static int ram_set_rw(void *addr, uint64_t length)
 {
-    return mem_protect(addr, length, PROT_READ | PROT_WRITE);
+    return mem_change_wp(addr, length, false);
 }
 
 int ram_block_list_set_readonly(void)
@@ -2475,14 +2507,15 @@ int ram_page_buffer_free(void *buffer)
     return qemu_madvise(buffer, TARGET_PAGE_SIZE, MADV_DONTNEED);
 }
 
-RAMBlock *ram_bgs_block_find(uint8_t *address, ram_addr_t *page_offset)
+RAMBlock *ram_bgs_block_find(uint64_t address, ram_addr_t *page_offset)
 {
     RAMBlock *block = NULL;
     RamBlockList *block_list = ram_bgs_block_list_get();
 
     QLIST_FOREACH(block, block_list, bgs_next) {
-        if (address - block->host < block->max_length) {
-            *page_offset = (address - block->host) & TARGET_PAGE_MASK;
+        uint64_t host = (uint64_t) block->host;
+        if (address - host < block->max_length) {
+            *page_offset = (address - host) & TARGET_PAGE_MASK;
             return block;
         }
     }
@@ -2530,7 +2563,7 @@ int ram_copy_page(RAMBlock *block, unsigned long page_nr,
 
     *page_copy = ram_page_buffer_get();
     if (!*page_copy) {
-        res =-1;
+        res = -1;
         goto out;
     }
 
@@ -2564,10 +2597,10 @@ out:
  *    0 > - on error
  *    0   - success
  *
- * @address:  guest address
+ * @address:  address of the faulted page
  *
  */
-int ram_process_page_fault(void *address)
+int ram_process_page_fault(uint64_t address)
 {
     int ret;
     void *page_copy = NULL;
@@ -2595,6 +2628,163 @@ int ram_process_page_fault(void *address)
     }
 
     return 0;
+}
+
+static int get_page_fault_fd(void)
+{
+    struct uffdio_api api_struct = { 0 };
+    uint64_t ioctl_mask = BIT(_UFFDIO_REGISTER) | BIT(_UFFDIO_UNREGISTER);
+    int ufd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+
+    if (ufd == -1) {
+        error_report("UFFD is not supported");
+        return -1;
+    }
+
+
+    api_struct.api = UFFD_API;
+    api_struct.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
+
+    if (ioctl(ufd, UFFDIO_API, &api_struct)) {
+        error_report("UFFDIO_API failed");
+        return -1;
+    }
+
+    if ((api_struct.ioctls & ioctl_mask) != ioctl_mask) {
+        error_report("Missing userfault feature");
+        return -1;
+    }
+
+    return ufd;
+}
+
+static void *page_fault_thread_fn(void *unused)
+{
+    GPollFD fds[2] = {
+        {.fd = page_fault_fd, .events = POLLIN | POLLERR | POLLHUP },
+        {.fd = thread_quit_fd, .events = POLLIN | POLLERR | POLLHUP },
+    };
+
+    while(true) {
+        struct uffd_msg msg;
+        ssize_t len;
+        int ret;
+
+        ret = qemu_poll_ns(fds, 2, -1);
+
+        if (ret < 0) {
+            error_report("Error on page fault fd polling: %d", ret);
+            break;
+        }
+
+        if (fds[1].revents) {
+            break;
+        }
+again:
+        len = read(fds[0].fd, &msg, sizeof(msg));
+
+        if (len == 0) {
+            break;
+        }
+
+        if (len < 0) {
+            error_report("Error on reading from page fault fd: %d", -errno);
+            if (errno == EAGAIN) {
+                goto again;
+            } else {
+                break;
+            }
+        }
+
+        if (msg.event != UFFD_EVENT_PAGEFAULT) {
+            error_report("Unknown event when reading page fault fd: %d",
+                         msg.event);
+            break;
+        }
+
+        if (!(msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP)) {
+            error_report("Error: got address "
+                         "without write protection flag [0x%llx]",
+                         msg.arg.pagefault.address);
+            break;
+        }
+
+        error_report("Processing fault at 0x%llx", msg.arg.pagefault.address);
+
+        if (ram_process_page_fault(msg.arg.pagefault.address) < 0) {
+            error_report("Error on write protected page "
+                         "processing [0x%llx]",
+                         msg.arg.pagefault.address);
+            break;
+        }
+
+        error_report("|_____ Done with fault at 0x%llx", msg.arg.pagefault.address);
+
+    }
+
+    return NULL;
+}
+
+static int page_fault_thread_start(void)
+{
+    page_fault_fd = get_page_fault_fd();
+    if (page_fault_fd == -1) {
+        page_fault_fd = 0;
+        error_report("Can't initiate usefaultfd");
+        return -1;
+    }
+
+    thread_quit_fd = eventfd(0, 0);
+    if (thread_quit_fd == -1) {
+        thread_quit_fd = 0;
+        error_report("Can't initiate thread control fd");
+        return -1;
+    }
+
+    qemu_thread_create(&page_fault_thread, "pagefault_thrd",
+                       page_fault_thread_fn, (void *) 0,
+                       QEMU_THREAD_JOINABLE);
+
+    return 0;
+}
+
+static void page_fault_thread_stop(void)
+{
+    if (page_fault_fd) {
+        close(page_fault_fd);
+        page_fault_fd = 0;
+    }
+
+    if (thread_quit_fd) {
+        uint64_t val = 1;
+        int ret;
+
+        ret = write(thread_quit_fd, &val, sizeof(val));
+        assert(ret == sizeof(val));
+
+        qemu_thread_join(&page_fault_thread);
+        close(thread_quit_fd);
+        thread_quit_fd = 0;
+    }
+}
+
+int ram_write_tracking_start(void)
+{
+    if (page_fault_thread_start()) {
+        return -1;
+    }
+
+    ram_block_list_create();
+    ram_block_list_set_readonly();
+
+    return 0;
+}
+
+void ram_write_tracking_stop(void)
+{
+    ram_block_list_set_writable();
+    page_fault_thread_stop();
+    ram_block_list_destroy();
 }
 
 /**
