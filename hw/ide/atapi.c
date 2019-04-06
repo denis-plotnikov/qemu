@@ -121,12 +121,13 @@ cd_read_sector_sync(IDEState *s)
 
     switch (s->cd_sector_size) {
     case 2048:
-        ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
-                        s->io_buffer, ATAPI_SECTOR_SIZE);
+        ret = blk_pread_flags(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
+                              s->io_buffer, ATAPI_SECTOR_SIZE, BDRV_REQ_GUEST);
         break;
     case 2352:
-        ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
-                        s->io_buffer + 16, ATAPI_SECTOR_SIZE);
+        ret = blk_pread_flags(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
+                              s->io_buffer + 16, ATAPI_SECTOR_SIZE,
+                              BDRV_REQ_GUEST);
         if (ret >= 0) {
             cd_data_to_raw(s->io_buffer, s->lba);
         }

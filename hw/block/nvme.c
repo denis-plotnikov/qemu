@@ -311,7 +311,7 @@ static uint16_t nvme_flush(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     req->has_sg = false;
     block_acct_start(blk_get_stats(n->conf.blk), &req->acct, 0,
          BLOCK_ACCT_FLUSH);
-    req->aiocb = blk_aio_flush(n->conf.blk, nvme_rw_cb, req);
+    req->aiocb = blk_aio_flush_guest(n->conf.blk, nvme_rw_cb, req);
 
     return NVME_NO_COMPLETE;
 }
@@ -336,7 +336,8 @@ static uint16_t nvme_write_zeros(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     block_acct_start(blk_get_stats(n->conf.blk), &req->acct, 0,
                      BLOCK_ACCT_WRITE);
     req->aiocb = blk_aio_pwrite_zeroes(n->conf.blk, offset, count,
-                                        BDRV_REQ_MAY_UNMAP, nvme_rw_cb, req);
+                                       BDRV_REQ_MAY_UNMAP | BDRV_REQ_GUEST,
+                                       nvme_rw_cb, req);
     return NVME_NO_COMPLETE;
 }
 
@@ -380,10 +381,10 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     } else {
         req->has_sg = false;
         req->aiocb = is_write ?
-            blk_aio_pwritev(n->conf.blk, data_offset, &req->iov, 0, nvme_rw_cb,
-                            req) :
-            blk_aio_preadv(n->conf.blk, data_offset, &req->iov, 0, nvme_rw_cb,
-                           req);
+            blk_aio_pwritev(n->conf.blk, data_offset, &req->iov,
+                            BDRV_REQ_GUEST, nvme_rw_cb, req) :
+            blk_aio_preadv(n->conf.blk, data_offset, &req->iov,
+                           BDRV_REQ_GUEST, nvme_rw_cb, req);
     }
 
     return NVME_NO_COMPLETE;
@@ -813,7 +814,7 @@ static void nvme_clear_ctrl(NvmeCtrl *n)
         }
     }
 
-    blk_flush(n->conf.blk);
+    blk_flush_guest(n->conf.blk);
     n->bar.cc = 0;
 }
 

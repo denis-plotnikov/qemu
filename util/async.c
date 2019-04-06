@@ -435,6 +435,7 @@ AioContext *aio_context_new(Error **errp)
     ctx->thread_pool = NULL;
     qemu_rec_mutex_init(&ctx->lock);
     timerlistgroup_init(&ctx->tlg, aio_timerlist_notify, ctx);
+    qemu_co_queue_init(&ctx->postponed_reqs);
 
     ctx->poll_ns = 0;
     ctx->poll_max_ns = 0;

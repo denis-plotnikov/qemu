@@ -179,7 +179,7 @@ int pci_piix3_xen_ide_unplug(DeviceState *dev, bool aux)
             DeviceState *ds = blk_get_attached_dev(blk);
 
             blk_drain(blk);
-            blk_flush(blk);
+            blk_flush_guest(blk);
 
             if (ds) {
                 blk_detach_dev(blk, ds);

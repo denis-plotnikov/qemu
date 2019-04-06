@@ -1115,12 +1115,37 @@ static int blk_check_byte_request(BlockBackend *blk, int64_t offset,
     return 0;
 }
 
+static void coroutine_fn blk_postpone_request(BlockBackend *blk)
+{
+    AioContext *ctx;
+
+    assert(qemu_in_coroutine());
+    ctx = qemu_coroutine_get_aio_context(qemu_coroutine_self());
+    /*
+     * Put the request to the postponed queue if
+     * external requests is currently not allowed.
+     * The request is continued when the drain
+     * section is left which means allowing external requests
+     */
+    if (aio_external_disabled(ctx)) {
+        blk_dec_in_flight(blk);
+        qemu_co_queue_wait(&ctx->postponed_reqs, NULL);
+        blk_inc_in_flight(blk);
+    }
+}
+
 int coroutine_fn blk_co_preadv(BlockBackend *blk, int64_t offset,
                                unsigned int bytes, QEMUIOVector *qiov,
                                BdrvRequestFlags flags)
 {
     int ret;
-    BlockDriverState *bs = blk_bs(blk);
+    BlockDriverState *bs;
+
+    if (flags & BDRV_REQ_GUEST) {
+        blk_postpone_request(blk);
+    }
+
+    bs = blk_bs(blk);
 
     trace_blk_co_preadv(blk, bs, offset, bytes, flags);
 
@@ -1147,7 +1172,13 @@ int coroutine_fn blk_co_pwritev(BlockBackend *blk, int64_t offset,
                                 BdrvRequestFlags flags)
 {
     int ret;
-    BlockDriverState *bs = blk_bs(blk);
+    BlockDriverState *bs;
+
+    if (flags & BDRV_REQ_GUEST) {
+        blk_postpone_request(blk);
+    }
+
+    bs = blk_bs(blk);
 
     trace_blk_co_pwritev(blk, bs, offset, bytes, flags);
 
@@ -1457,6 +1488,10 @@ static void blk_aio_flush_entry(void *opaque)
     BlkAioEmAIOCB *acb = opaque;
     BlkRwCo *rwco = &acb->rwco;
 
+    if (rwco->flags & BDRV_REQ_GUEST) {
+        blk_postpone_request(rwco->blk);
+    }
+
     rwco->ret = blk_co_flush(rwco->blk);
     blk_aio_complete(acb);
 }
@@ -1467,10 +1502,21 @@ BlockAIOCB *blk_aio_flush(BlockBackend *blk,
     return blk_aio_prwv(blk, 0, 0, NULL, blk_aio_flush_entry, 0, cb, opaque);
 }
 
+BlockAIOCB *blk_aio_flush_guest(BlockBackend *blk,
+                                BlockCompletionFunc *cb, void *opaque)
+{
+    return blk_aio_prwv(blk, 0, 0, NULL, blk_aio_flush_entry,
+                        BDRV_REQ_GUEST, cb, opaque);
+}
+
 static void blk_aio_pdiscard_entry(void *opaque)
 {
     BlkAioEmAIOCB *acb = opaque;
     BlkRwCo *rwco = &acb->rwco;
+
+    if (rwco->flags & BDRV_REQ_GUEST) {
+        blk_postpone_request(rwco->blk);
+    }
 
     rwco->ret = blk_co_pdiscard(rwco->blk, rwco->offset, acb->bytes);
     blk_aio_complete(acb);
@@ -1482,6 +1528,14 @@ BlockAIOCB *blk_aio_pdiscard(BlockBackend *blk,
 {
     return blk_aio_prwv(blk, offset, bytes, NULL, blk_aio_pdiscard_entry, 0,
                         cb, opaque);
+}
+
+BlockAIOCB *blk_aio_pdiscard_guest(BlockBackend *blk,
+                                   int64_t offset, int bytes,
+                                   BlockCompletionFunc *cb, void *opaque)
+{
+    return blk_aio_prwv(blk, offset, bytes, NULL, blk_aio_pdiscard_entry,
+                        BDRV_REQ_GUEST, cb, opaque);
 }
 
 void blk_aio_cancel(BlockAIOCB *acb)
@@ -1556,6 +1610,13 @@ int blk_co_flush(BlockBackend *blk)
 static void blk_flush_entry(void *opaque)
 {
     BlkRwCo *rwco = opaque;
+
+    if (rwco->flags & BDRV_REQ_GUEST) {
+        blk_inc_in_flight(rwco->blk);
+        blk_postpone_request(rwco->blk);
+        blk_dec_in_flight(rwco->blk);
+    }
+
     rwco->ret = blk_co_flush(rwco->blk);
     aio_wait_kick();
 }
@@ -1563,6 +1624,11 @@ static void blk_flush_entry(void *opaque)
 int blk_flush(BlockBackend *blk)
 {
     return blk_prw(blk, 0, NULL, 0, blk_flush_entry, 0);
+}
+
+int blk_flush_guest(BlockBackend *blk)
+{
+    return blk_prw(blk, 0, NULL, 0, blk_flush_entry, BDRV_REQ_GUEST);
 }
 
 void blk_drain(BlockBackend *blk)

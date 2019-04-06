@@ -463,7 +463,7 @@ static void ide_issue_trim_cb(void *opaque, int ret)
                 }
 
                 /* Got an entry! Submit and exit.  */
-                iocb->aiocb = blk_aio_pdiscard(s->blk,
+                iocb->aiocb = blk_aio_pdiscard_guest(s->blk,
                                                sector << BDRV_SECTOR_BITS,
                                                count << BDRV_SECTOR_BITS,
                                                ide_issue_trim_cb, opaque);
@@ -666,7 +666,8 @@ BlockAIOCB *ide_buffered_readv(IDEState *s, int64_t sector_num,
                         iov->size);
 
     aioreq = blk_aio_preadv(s->blk, sector_num << BDRV_SECTOR_BITS,
-                            &req->qiov, 0, ide_buffered_readv_cb, req);
+                            &req->qiov, BDRV_REQ_GUEST,
+                            ide_buffered_readv_cb, req);
 
     QLIST_INSERT_HEAD(&s->buffered_requests, req, list);
     return aioreq;
@@ -1049,7 +1050,8 @@ static void ide_sector_write(IDEState *s)
     block_acct_start(blk_get_stats(s->blk), &s->acct,
                      n * BDRV_SECTOR_SIZE, BLOCK_ACCT_WRITE);
     s->pio_aiocb = blk_aio_pwritev(s->blk, sector_num << BDRV_SECTOR_BITS,
-                                   &s->qiov, 0, ide_sector_write_cb, s);
+                                   &s->qiov, BDRV_REQ_GUEST,
+                                   ide_sector_write_cb, s);
 }
 
 static void ide_flush_cb(void *opaque, int ret)
@@ -1086,7 +1088,7 @@ static void ide_flush_cache(IDEState *s)
     s->status |= BUSY_STAT;
     ide_set_retry(s);
     block_acct_start(blk_get_stats(s->blk), &s->acct, 0, BLOCK_ACCT_FLUSH);
-    s->pio_aiocb = blk_aio_flush(s->blk, ide_flush_cb, s);
+    s->pio_aiocb = blk_aio_flush_guest(s->blk, ide_flush_cb, s);
 }
 
 static void ide_cfata_metadata_inquiry(IDEState *s)
