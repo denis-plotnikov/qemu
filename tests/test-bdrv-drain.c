@@ -100,12 +100,20 @@ static void bdrv_test_child_perm(BlockDriverState *bs, BdrvChild *c,
                               nperm, nshared);
 }
 
+static int coroutine_fn bdrv_test_co_pwritev(BlockDriverState *bs,
+                                            uint64_t offset, uint64_t bytes,
+                                            QEMUIOVector *qiov, int flags)
+{
+    return 0;
+}
+
 static BlockDriver bdrv_test = {
     .format_name            = "test",
     .instance_size          = sizeof(BDRVTestState),
 
     .bdrv_close             = bdrv_test_close,
     .bdrv_co_preadv         = bdrv_test_co_preadv,
+    .bdrv_co_pwritev        = bdrv_test_co_pwritev,
 
     .bdrv_co_drain_begin    = bdrv_test_co_drain_begin,
     .bdrv_co_drain_end      = bdrv_test_co_drain_end,
@@ -1531,6 +1539,48 @@ static void test_set_aio_context(void)
     iothread_join(b);
 }
 
+static void test_io_while_drained(void)
+{
+    BlockBackend *blk;
+    BlockDriverState *bs;
+    BlockAIOCB *acb;
+    int aio_ret = -EINPROGRESS;
+
+    QEMUIOVector qiov = QEMU_IOVEC_INIT_BUF(qiov, NULL, 0);
+
+    blk = blk_new(BLK_PERM_ALL, BLK_PERM_ALL);
+    bs = bdrv_new_open_driver(&bdrv_test, "test-node", BDRV_O_RDWR,
+                              &error_abort);
+    blk_insert_bs(blk, bs, &error_abort);
+
+    /* an io request can't be executed in the "drain section" */
+    do_drain_begin(BDRV_DRAIN_ALL, bs);
+
+    acb = blk_aio_pwritev(blk, 0, &qiov, BDRV_REQ_GUEST, aio_ret_cb, &aio_ret);
+
+    g_assert(acb != NULL);
+    g_assert_cmpint(aio_ret, ==, -EINPROGRESS);
+    g_assert_cmpint(bs->in_flight, ==, 0);
+
+    do_drain_end(BDRV_DRAIN_ALL, bs);
+
+    g_assert_cmpint(aio_ret, ==, 0);
+
+
+    /* an interanl request can be executed in the "drain section" */
+    do_drain_begin(BDRV_DRAIN_ALL, bs);
+
+    acb = blk_aio_pwritev(blk, 0, &qiov, 0, aio_ret_cb, &aio_ret);
+
+    g_assert(acb != NULL);
+    g_assert_cmpint(aio_ret, ==, 0);
+
+    do_drain_end(BDRV_DRAIN_ALL, bs);
+
+    bdrv_unref(bs);
+    blk_unref(blk);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -1613,6 +1663,7 @@ int main(int argc, char **argv)
     g_test_add_func("/bdrv-drain/attach/drain", test_append_to_drained);
 
     g_test_add_func("/bdrv-drain/set_aio_context", test_set_aio_context);
+    g_test_add_func("/bdrv-drain/io_while_drained", test_io_while_drained);
 
     ret = g_test_run();
     qemu_event_destroy(&done_event);
