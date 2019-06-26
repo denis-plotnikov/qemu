@@ -1118,9 +1118,12 @@ static int blk_check_byte_request(BlockBackend *blk, int64_t offset,
 static void coroutine_fn blk_postpone_request(BlockBackend *blk)
 {
     AioContext *ctx;
+    Coroutine *co;
 
     assert(qemu_in_coroutine());
-    ctx = qemu_coroutine_get_aio_context(qemu_coroutine_self());
+
+    co = qemu_coroutine_self();
+    ctx = qemu_coroutine_get_aio_context(co);
     /*
      * Put the request to the postponed queue if
      * external requests is currently not allowed.
@@ -1129,7 +1132,11 @@ static void coroutine_fn blk_postpone_request(BlockBackend *blk)
      */
     if (aio_external_disabled(ctx)) {
         blk_dec_in_flight(blk);
+
+        trace_blk_request_postponed(blk, blk_bs(blk), co);
         qemu_co_queue_wait(&ctx->postponed_reqs, NULL);
+        trace_blk_request_resumed(blk, blk_bs(blk), co);
+
         blk_inc_in_flight(blk);
     }
 }
